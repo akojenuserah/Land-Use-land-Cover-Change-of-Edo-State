@@ -1,0 +1,98 @@
+
+var geometry = table.filter(ee.Filter.eq("state_name", "Edo"));
+var composite = image
+
+print(composite);
+Map.addLayer(composite, imageVisParam, "Composite");
+
+var groundpoints = water.merge(urban).merge(bareground).merge(vegetation);
+
+
+
+
+var gcp = groundpoints.randomColumn();
+
+
+var trainingGcp = gcp.filter(ee.Filter.lt('random', 0.7));
+var validationGcp = gcp.filter(ee.Filter.gte('random', 0.7));
+
+
+
+// Overlay the point on the image to get training data.
+var training = composite.sampleRegions({
+  collection: trainingGcp, 
+  properties: ['cover'], 
+  scale: 10,
+  tileScale: 16
+});
+
+print("This is the training data: ", training.size());
+
+
+//Training the classifier
+
+var classifier = ee.Classifier.smileRandomForest(50)
+.train({
+  features: training,  
+  classProperty: 'cover',
+  inputProperties: composite.bandNames()
+});
+
+
+// Classify the image.
+var classified = composite.classify(classifier);
+
+
+
+var palette = ['#0f3ed6', '#f9350f', '#e4a70e', '#3ce423' ];
+
+print(classified)
+Map.addLayer(classified.clip(geometry), {min: 0, max: 3, palette: palette}, 'Classified');
+
+
+
+// Accuracy Assesment
+
+var test = classified.sampleRegions({
+  collection: validationGcp,
+  properties: ['cover'],
+  tileScale: 16,
+  scale: 10,
+});
+
+var testConfusionMatrix = test.errorMatrix('cover', 'classification')
+// Printing of confusion matrix may time out. Alternatively, you can export it as CSV
+print('Confusion Matrix', testConfusionMatrix);
+print('Test Accuracy', testConfusionMatrix.accuracy());
+
+
+
+// // POST PROCESSING BY CLUSTERING( This is to smotthen the classified image)
+// //************************************************************************** 
+
+
+// Cluster using Unsupervised Clustering methods
+var seeds = ee.Algorithms.Image.Segmentation.seedGrid(5);
+
+var snic = ee.Algorithms.Image.Segmentation.SNIC({
+  image: composite.select("B*."), 
+  compactness: 2,
+  connectivity: 8,
+  neighborhoodSize: 10,
+  size:2,
+  seeds: seeds
+})
+var clusters = snic.select('clusters');
+
+// // Assign class to each cluster based on 'majority' voting (using ee.Reducer.mode()
+var smoothed = classified.addBands(clusters).clip(geometry);
+
+var clusterMajority = smoothed.reduceConnectedComponents({
+  reducer: ee.Reducer.mode(),
+  labelBand: 'clusters'
+});
+
+
+Map.addLayer(clusterMajority, {min: 0, max: 2, palette: palette}, 'Processed using Clusters');
+
+

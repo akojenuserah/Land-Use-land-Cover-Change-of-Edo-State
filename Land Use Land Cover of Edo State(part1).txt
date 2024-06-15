@@ -1,0 +1,141 @@
+//      (1) LOADING THE AREA OF INTEREST AND ADDING IT TO THE MAP
+//**************************************************************************
+
+var geometry = table.filter(ee.Filter.eq("state_name", "Edo"));
+Map.addLayer(geometry, {"color":"red"}, "Geometry");
+Map.centerObject(geometry, 7);
+
+
+
+//      (2) LOADING THE SENTINEL 2 DATA 
+//**************************************************************************
+
+
+var filtered = s2
+.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+  .filter(ee.Filter.date('2019-01-01', '2020-01-01'))
+  .filter(ee.Filter.bounds(geometry))
+
+
+
+//      (3) CLOUD MASKING
+//**************************************************************************
+
+// Load the Cloud Score+ collection
+var csPlus = ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED');
+var csPlusBands = csPlus.first().bandNames();
+
+
+var filteredS2WithCs = filtered.linkCollection(csPlus, csPlusBands);
+
+// Function to mask pixels with low CS+ QA scores.
+function maskLowQA(image) {
+  var qaBand = 'cs';
+  var clearThreshold = 0.5;
+  var mask = image.select(qaBand).gte(clearThreshold);
+  return image.updateMask(mask);
+}
+
+var filteredMasked = filteredS2WithCs
+  .map(maskLowQA)
+  .select('B.*');
+  
+  
+var composite = filteredMasked.median();
+
+var rgbVis = {min: 0.0, max: 3000, bands: ['B4', 'B3', 'B2']};
+
+
+print("cloudmasked composite:", composite);
+
+
+
+//      (4)  ADDING INDICES TO THE MAP
+//**************************************************************************
+
+
+var addIndices = function(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename(['ndvi']);
+  var ndbi = image.normalizedDifference(['B11', 'B8']).rename(['ndbi']);
+  var mndwi = image.normalizedDifference(['B3', 'B11']).rename(['mndwi']); 
+  var bsi = image.expression(
+      '(( X + Y ) - (A + B)) /(( X + Y ) + (A + B)) ', {
+        'X': image.select('B11'), //swir1
+        'Y': image.select('B4'),  //red
+        'A': image.select('B8'), // nir
+        'B': image.select('B2'), // blue
+  }).rename('bsi');
+  return image.addBands(ndvi).addBands(ndbi).addBands(mndwi).addBands(bsi);
+};
+
+
+composite = addIndices(composite)
+
+
+
+// Calculating Slope and Elevation Using Alos
+
+var proj = alos.first().projection();
+
+var elevation = alos.select('DSM').mosaic()
+  .setDefaultProjection(proj)
+  .rename('elev');
+
+var slope = ee.Terrain.slope(elevation)
+  .rename('slope');
+
+var composite = composite.addBands(elevation).addBands(slope);
+Map.addLayer(composite.clip(geometry), rgbVis, ' Composite');
+print("composite:", composite);
+
+//      (5)  NORMALISING THE BANDS TO BE WITHIN 0 TO 1
+//**************************************************************************
+// Machine learning algorithms work best on images when all features have
+// the same range[Formula is (x - xmin) / (xmax - xmin)]
+//************************************************************************** 
+
+function normalize(image){
+  var bandNames = image.bandNames();
+  // Compute min and max of the image
+  var minDict = image.reduceRegion({
+    reducer: ee.Reducer.min(),
+    geometry: geometry,
+    scale: 10,
+    maxPixels: 1e9,
+    bestEffort: true,
+    tileScale: 16
+  });
+  var maxDict = image.reduceRegion({
+    reducer: ee.Reducer.max(),
+    geometry: geometry,
+    scale: 10,
+    maxPixels: 1e9,
+    bestEffort: true,
+    tileScale: 16
+  });
+  var mins = ee.Image.constant(minDict.values(bandNames));
+  var maxs = ee.Image.constant(maxDict.values(bandNames));
+
+  var normalized = image.subtract(mins).divide(maxs.subtract(mins));
+  return normalized;
+}
+
+var composite = normalize(composite);
+
+Map.addLayer(composite.clip(geometry), rgbVis, 'normalised Composite');
+print("normalised composite:", composite);
+
+
+
+//      (6)  EXPORTING THE FINAL COMPOSITE TO MY ASSET TO BE USED FOR CLASSIFICATION
+//**************************************************************************
+
+Export.image.toAsset({
+  image: composite.clip(geometry),
+  description: "Assignment_3_Composite",
+  assetId: "users/akojenuserah2/Assignment3_composite",
+  pyramidingPolicy:"mode",
+  region: geometry,
+  scale: 10,
+  maxPixels: 1e10
+});
